@@ -1,4 +1,3 @@
-# flipkart_scraper_clean.py
 import time
 import random
 import re
@@ -12,7 +11,6 @@ from urllib3.util.retry import Retry
 SEARCH_URL = "https://www.flipkart.com/search?q={}"
 
 USER_AGENTS = [
-    # rotate UA to reduce chance of different mobile/desktop markup
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
@@ -34,14 +32,11 @@ def create_session() -> requests.Session:
     return s
 
 def _extract_image_src(tag) -> Optional[str]:
-    """Return the best image URL or None. Do NOT return placeholders."""
     if not tag:
         return None
-    # common attributes where Flipkart keeps images
     for attr in ("data-src", "data-image", "data-srcset", "src", "data-original", "data-hires"):
         val = tag.get(attr)
         if val:
-            # if srcset-like, pick the first URL
             if "," in val:
                 first = val.split(",")[0].strip().split(" ")[0]
                 if first.startswith("//"):
@@ -50,7 +45,6 @@ def _extract_image_src(tag) -> Optional[str]:
             if val.startswith("//"):
                 return "https:" + val
             return val
-    # try srcset explicitly
     srcset = tag.get("srcset") or ""
     if srcset:
         first = srcset.split(",")[0].strip().split(" ")[0]
@@ -66,11 +60,61 @@ def _first_reasonable_text(text: str, min_len=6, max_len=220) -> Optional[str]:
             return p
     return None
 
+def _clean_title(raw: str) -> Optional[str]:
+    """Clean large concatenated card text into a sane title or None."""
+    if not raw:
+        return None
+    s = raw.strip()
+    # remove common prefix
+    s = re.sub(r'^\s*Add to Compare\s*', '', s, flags=re.I)
+    # cut off from price marker onward (₹ usually marks start of price/offer junk)
+    if "₹" in s:
+        s = s.split("₹", 1)[0]
+    # remove 'xx Ratings' and 'xx Reviews' blocks
+    s = re.sub(r'\d[\d,]*\s*Ratings?', '', s, flags=re.I)
+    s = re.sub(r'\d[\d,]*\s*Reviews?', '', s, flags=re.I)
+    # remove phrases like "Upto..." / "Off on Exchange" etc (a conservative approach)
+    s = re.split(r'Upto|Off on|Bank Offer|Only few left|In the box|Warranty|Warranty for', s, maxsplit=1, flags=re.I)[0]
+    # collapse whitespace
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    # if still too long, take first sentence / chunk
+    if len(s) > 180:
+        s = s[:180].rsplit(' ', 1)[0]  # avoid cutting mid-word
+    return s if s else None
+
+def _extract_rating(card, a_tag=None) -> Optional[str]:
+    """
+    Extract rating as a single-digit or single-digit-with-decimal like '4' or '4.6'.
+    Avoid capturing review counts (which are large integers with commas).
+    """
+    # 1) common Flipkart rating element (e.g. div._3LWZlK)
+    rating_selectors = ["div._3LWZlK", "span._2_KrJI"]
+    for sel in rating_selectors:
+        r = card.select_one(sel)
+        if r:
+            txt = r.get_text(strip=True)
+            # only accept patterns like 4 or 4.6 or 4.61 (limit decimals to at most 2)
+            m = re.match(r'^[0-5](?:\.[0-9]{1,2})?$', txt)
+            if m:
+                return m.group(0)
+    # 2) look for 'x.x ★' or 'x.x out of 5' near the card text
+    full = card.get_text(" ", strip=True)
+    m = re.search(r'([0-5](?:\.[0-9]{1,2})?)\s*(?:★|out of 5|/5)', full, flags=re.I)
+    if m:
+        return m.group(1)
+    # 3) sometimes rating sits inside the anchor or adjacent small text, try a_tag
+    if a_tag:
+        a_text = a_tag.get_text(" ", strip=True)
+        m = re.search(r'([0-5](?:\.[0-9]{1,2})?)\s*(?:★|out of 5|/5)', a_text, flags=re.I)
+        if m:
+            return m.group(1)
+    # If nothing reliable found, return None (do NOT return big ints)
+    return None
+
 def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) -> List[Dict]:
     session = create_session()
-    # Preflight to obtain cookies (ignore errors)
     try:
-        session.get("https://www.flipkart.com", headers=get_headers(), timeout=8)
+        session.get("https://www.flipkart.com", headers=get_headers(), timeout=6)
     except Exception:
         pass
 
@@ -80,15 +124,9 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # candidate container selectors
     container_selectors = [
-        "div._13oc-S",     # common grid container
-        "div[data-id]",    # generic product cards (your logs found this)
-        "div._1AtVbE",     # alternate
-        "div._2kHMtA",     # product card
-        "a.s1Q9rs",        # some small card anchors (used for mobiles)
-        "div._3liAhj",     # other layouts
-        "div._2kSfQ4"      # sometimes used
+        "div._13oc-S", "div[data-id]", "div._1AtVbE", "div._2kHMtA",
+        "a.s1Q9rs", "div._3liAhj", "div._2kSfQ4"
     ]
 
     candidates = []
@@ -100,7 +138,6 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                 print(f"Found {len(found)} candidates with selector: {sel}")
             break
 
-    # anchor fallback (links to /p/)
     if not candidates:
         anchors = soup.find_all("a", href=re.compile(r"/p/"))
         seen = set()
@@ -117,17 +154,14 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
             print(f"Fallback anchors found: {len(candidates)}")
 
     results = []
-    # selectors to try for each field (multiple fallbacks)
     title_selectors = ["div._4rR01T", "a.s1Q9rs", "a.IRpwTa", "div._2WkVRV", "span.B_NuCI", "div._3wU53n"]
     price_selectors = ["div._30jeq3", "div._1vC4OE", "div._25b18c", "span._2-ut7f"]
-    rating_selectors = ["div._3LWZlK", "span._2_KrJI", "div._3i9_wc"]
 
     for idx, card in enumerate(candidates):
         if len(results) >= max_results:
             break
-
         try:
-            # try to find an anchor to product page
+            # find anchor
             a_tag = None
             if card.name == "a" and card.get("href") and re.search(r"/p/", card.get("href")):
                 a_tag = card
@@ -144,7 +178,7 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                     else:
                         link = "https://www.flipkart.com" + href
 
-            # TITLE: many fallbacks (keep None if not found)
+            # TITLE: prefer strict selectors; only fallback to big text when necessary, then CLEAN it
             title = None
             for ts in title_selectors:
                 t = card.select_one(ts)
@@ -152,17 +186,14 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                     title = t.get_text(strip=True)
                     break
             if not title and a_tag:
-                # anchor title attribute / direct anchor text
+                # try anchor title attribute
                 title = (a_tag.get("title") or a_tag.get_text(strip=True)) or None
+
             if not title:
-                # try image alt
-                img_for_title = card.select_one("img") or (a_tag.select_one("img") if a_tag else None)
-                if img_for_title:
-                    title = img_for_title.get("alt") or img_for_title.get("title")
-            if not title:
-                # fallback: first reasonable chunk of text in card
-                txt = card.get_text(" ", strip=True)
-                title = _first_reasonable_text(txt)
+                # fallback to first reasonable chunk and then clean
+                raw = card.get_text(" ", strip=True)
+                candidate_title = _first_reasonable_text(raw)
+                title = _clean_title(candidate_title or raw)
 
             # PRICE
             price = None
@@ -173,28 +204,14 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                     if ptxt:
                         price = ptxt
                         break
-            # regex fallback (if price shown elsewhere)
             if not price:
-                all_text = card.get_text(" ", strip=True)
-                m = re.search(r'₹\s?[\d,]+(?:\.\d{1,2})?', all_text)
+                allt = card.get_text(" ", strip=True)
+                m = re.search(r'₹\s?[\d,]+(?:\.\d{1,2})?', allt)
                 if m:
                     price = m.group().replace(" ", "")
 
-            # RATING
-            rating = None
-            for rs in rating_selectors:
-                rtag = card.select_one(rs)
-                if rtag:
-                    rtxt = rtag.get_text(strip=True)
-                    rm = re.search(r'(\d+(?:\.\d+)?)', rtxt)
-                    if rm:
-                        rating = rm.group(1)
-                        break
-            if not rating:
-                # sometimes rating appears near review counts e.g. "4.3 ★ | 1,234 Ratings"
-                m = re.search(r'(\d+(?:\.\d+)?)\s*(?:★|Ratings|Rating)', card.get_text(" ", strip=True), re.I)
-                if m:
-                    rating = m.group(1)
+            # RATING (robust)
+            rating = _extract_rating(card, a_tag=a_tag)
 
             # IMAGE
             img_tag = None
@@ -204,7 +221,6 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                 img_tag = card.select_one("img")
             image = _extract_image_src(img_tag)
 
-            # Build the result: only actual scraped values or None (no static defaults)
             item = {
                 "title": title if title else None,
                 "link": link if link else None,
@@ -213,13 +229,12 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                 "rating": rating if rating else None
             }
 
-            # if there's no title and no link, skip — it's not a product
+            # skip if no title and no link
             if not item["title"] and not item["link"]:
                 if verbose:
                     print(f"Skipping candidate #{idx}: no title and no link")
                 continue
 
-            # append result (even if some fields are None — we do NOT insert defaults)
             results.append(item)
 
             if verbose:
@@ -236,5 +251,4 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
         print(f"Scraped {len(results)} items for query={query}")
 
     return results
-
 
