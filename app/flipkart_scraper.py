@@ -59,9 +59,16 @@ def scrape_flipkart(query: str, max_results: int = 20):
         results = []
         for i, item in enumerate(items[:max_results]):
             try:
-                # Extract link
+                # Debug: Print item HTML for first few items
+                if i < 3:
+                    print(f"🔍 Item {i} HTML snippet: {str(item)[:300]}...")
+                
+                # Extract link - try multiple selectors
                 link = None
-                link_selectors = ["a._1fQZEK", "a.s1Q9rs", "a[href*='/p/']", "a[href*='flipkart.com']"]
+                link_selectors = [
+                    "a._1fQZEK", "a.s1Q9rs", "a[href*='/p/']", "a[href*='flipkart.com']",
+                    "a[href*='product']", "a", "[data-testid*='product'] a"
+                ]
                 for selector in link_selectors:
                     a = item.select_one(selector)
                     if a and a.has_attr("href"):
@@ -69,12 +76,14 @@ def scrape_flipkart(query: str, max_results: int = 20):
                         link = f"https://www.flipkart.com{href}" if href.startswith("/") else href
                         break
                 
-                # Extract title
+                # Extract title - try multiple selectors and methods
                 title = None
                 title_selectors = [
                     "div._4rR01T", "a.s1Q9rs", "div._2WkVRV", "span.B_NuCI",
                     "div._3pLy-c", "div._2kHMtA", "div._1AtVbE",
-                    "h3", "h2", "h1", "div[class*='title']", "span[class*='title']"
+                    "h3", "h2", "h1", "div[class*='title']", "span[class*='title']",
+                    "div[class*='name']", "span[class*='name']", "div[class*='product']",
+                    "a.VJA3rP", "a[class*='VJA3rP']", "div.slAVV4 a"
                 ]
                 for selector in title_selectors:
                     t = item.select_one(selector)
@@ -83,11 +92,43 @@ def scrape_flipkart(query: str, max_results: int = 20):
                         if title and len(title) > 3:
                             break
                 
-                # If no title found, try to extract from link text
+                # If no title found, try to extract from link href (product name in URL)
+                if not title:
+                    a = item.select_one("a")
+                    if a and a.has_attr("href"):
+                        href = a["href"]
+                        if i < 3:
+                            print(f"🔍 Item {i} href: {href}")
+                        # Extract product name from URL path - the part before /p/
+                        if "/p/" in href:
+                            # Extract everything before /p/ and clean it up
+                            match = re.search(r'/([^/]+)/p/', href)
+                            if match:
+                                product_name = match.group(1)
+                                # Replace hyphens with spaces and clean up
+                                title = product_name.replace("-", " ").replace("_", " ")
+                                # Remove common suffixes and clean up
+                                title = re.sub(r'\b(pid|lid|marketplace|store|q|amp).*', '', title)
+                                title = title.strip()
+                                if i < 3:
+                                    print(f"🔍 Item {i} extracted title from URL: '{title}'")
+                                # Don't break here, continue to other methods if needed
+                
+                # If still no title, try to extract from link text
                 if not title:
                     a = item.select_one("a")
                     if a:
                         title = a.get_text(strip=True)
+                
+                # If still no title, try to find any meaningful text in the item
+                if not title:
+                    all_text = item.get_text(strip=True)
+                    # Split by common separators and find the longest meaningful text
+                    text_parts = re.split(r'[₹\n\t]', all_text)
+                    for part in text_parts:
+                        if len(part.strip()) > 10 and not re.match(r'^\d+$', part.strip()):
+                            title = part.strip()
+                            break
                 
                 # Extract price using regex as primary method
                 price = None
@@ -97,7 +138,10 @@ def scrape_flipkart(query: str, max_results: int = 20):
                     price = price_match.group()
                 else:
                     # Try CSS selectors
-                    price_selectors = ["div._30jeq3", "div._1vC4OE", "span._2-ut7f", "div[class*='price']"]
+                    price_selectors = [
+                        "div._30jeq3", "div._1vC4OE", "span._2-ut7f", "div[class*='price']",
+                        "span[class*='price']", "div[class*='cost']", "span[class*='cost']"
+                    ]
                     for selector in price_selectors:
                         p = item.select_one(selector)
                         if p:
@@ -116,7 +160,10 @@ def scrape_flipkart(query: str, max_results: int = 20):
                 
                 if not rating:
                     # Try CSS selectors
-                    rating_selectors = ["div._3LWZlK", "span._2_KrJI", "div._3i9_wc", "div[class*='rating']"]
+                    rating_selectors = [
+                        "div._3LWZlK", "span._2_KrJI", "div._3i9_wc", "div[class*='rating']",
+                        "span[class*='rating']", "div[class*='star']", "span[class*='star']"
+                    ]
                     for selector in rating_selectors:
                         r = item.select_one(selector)
                         if r:
@@ -128,9 +175,12 @@ def scrape_flipkart(query: str, max_results: int = 20):
                                     rating = str(rating_val)
                                     break
                 
-                # Extract image
+                # Extract image - try multiple selectors
                 image = None
-                img_selectors = ["img._396cs4", "img._2r_T1I", "img._3exPp9", "img[class*='product']", "img"]
+                img_selectors = [
+                    "img._396cs4", "img._2r_T1I", "img._3exPp9", "img[class*='product']",
+                    "img[class*='item']", "img", "[data-testid*='image'] img"
+                ]
                 for selector in img_selectors:
                     img = item.select_one(selector)
                     if img and img.has_attr("src"):
@@ -139,7 +189,17 @@ def scrape_flipkart(query: str, max_results: int = 20):
                             image = src if src.startswith("http") else f"https:{src}" if src.startswith("//") else None
                             break
                 
-                if title and len(title.strip()) > 3:  # Only add if we have a valid title
+                # Debug: Print extracted data for first few items
+                if i < 3:
+                    print(f"📊 Item {i} extracted: title='{title}', price='{price}', rating='{rating}'")
+                    print(f"🔗 Link: {link}")
+                    print(f"🖼️ Image: {image}")
+                    print(f"🔍 Title length: {len(title.strip()) if title else 0}")
+                    print(f"🔍 Title check: {bool(title and len(title.strip()) > 3)}")
+                
+                # Only add if we have at least a title
+                if title and len(title.strip()) > 3:
+                    print(f"✅ Adding item {i}: '{title}'")
                     results.append({
                         "title": title,
                         "link": link,
@@ -147,6 +207,9 @@ def scrape_flipkart(query: str, max_results: int = 20):
                         "price": price,
                         "rating": rating
                     })
+                else:
+                    if i < 3:
+                        print(f"⚠️ Skipping item {i} - no valid title found (title='{title}', length={len(title.strip()) if title else 0})")
                     
             except Exception as e:
                 print(f"⚠️ Error processing item {i}: {e}")
