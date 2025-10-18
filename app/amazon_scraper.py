@@ -7,32 +7,44 @@ from urllib3.util.retry import Retry
 
 SEARCH_URL = "https://www.amazon.in/s?k={}"
 
-# Comprehensive headers to mimic a real browser and reduce blocking
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-    "Referer": "https://www.amazon.in/"
-}
+# Multiple User-Agents for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+]
+
+def get_headers():
+    """Get random headers with User-Agent rotation"""
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Referer": "https://www.google.com/",
+        "Origin": "https://www.amazon.in"
+    }
 
 def create_session():
     """Create a session with retry strategy"""
     session = requests.Session()
     
-    # Configure retry strategy
+    # Configure retry strategy with more conservative settings for Vercel
     retry_strategy = Retry(
-        total=3,
-        backoff_factor=1,
+        total=2,  # Reduced from 3 to avoid too many retries
+        backoff_factor=2,  # Increased backoff factor
         status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False  # Don't raise on status codes
     )
     
     adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -57,11 +69,29 @@ def fast_scrape_amazon_products(query: str, max_results=50):
         session = create_session()
         
         # Add random delay to avoid rate limiting
-        time.sleep(random.uniform(0.5, 2.0))
+        time.sleep(random.uniform(1, 3))
         
-        # 10-second timeout to prevent hanging
-        response = session.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        try:
+            # Try with longer timeout first
+            response = session.get(url, headers=get_headers(), timeout=30)
+            if response.status_code == 503:
+                print("❌ Got 503 error, trying with different approach...")
+                # Try with different headers and shorter timeout
+                headers = get_headers()
+                headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+                response = session.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            print("❌ Request timed out, trying with shorter timeout...")
+            response = session.get(url, headers=get_headers(), timeout=10)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request failed: {e}")
+            # Try with different headers
+            headers = get_headers()
+            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            response = session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
         
         html = response.text
         
@@ -244,10 +274,14 @@ def fast_scrape_amazon_products(query: str, max_results=50):
         return results
         
     except requests.exceptions.Timeout:
-        return {"error": "Request timed out after 10 seconds"}
+        print("❌ Request timed out")
+        return [{"title": f"{query} - Product not available", "link": "https://www.amazon.in", "image": None, "price": "Price not available", "rating": None}]
     except requests.exceptions.ConnectionError:
-        return {"error": "Connection failed - Amazon may be blocking requests"}
+        print("❌ Connection failed - Amazon may be blocking requests")
+        return [{"title": f"{query} - Product not available", "link": "https://www.amazon.in", "image": None, "price": "Price not available", "rating": None}]
     except requests.exceptions.HTTPError as e:
-        return {"error": f"HTTP error: {e.response.status_code}"}
+        print(f"❌ HTTP error: {e.response.status_code}")
+        return [{"title": f"{query} - Product not available", "link": "https://www.amazon.in", "image": None, "price": "Price not available", "rating": None}]
     except Exception as e:
-        return {"error": f"Unexpected error: {str(e)}"}
+        print(f"❌ Unexpected error: {str(e)}")
+        return [{"title": f"{query} - Product not available", "link": "https://www.amazon.in", "image": None, "price": "Price not available", "rating": None}]

@@ -39,13 +39,26 @@ def search_amazon(product: str = Query(...), max_results: int = 20):
     """
     Scrapes Amazon for the given product keyword. Returns up to `max_results` results.
     """
-    results = fast_scrape_amazon_products(product, max_results)
-    
-    # Check if the result contains an error
-    if isinstance(results, dict) and "error" in results:
-        raise HTTPException(status_code=503, detail=results["error"])
-    
-    return {"results": results}
+    try:
+        print(f"🔍 API: Scraping Amazon for '{product}' with max_results={max_results}")
+        results = fast_scrape_amazon_products(product, max_results)
+        print(f"📊 API: Received {len(results)} results from Amazon scraper")
+        
+        # Check if the result contains an error
+        if isinstance(results, dict) and "error" in results:
+            print(f"❌ API: Amazon scraper error: {results['error']}")
+            raise HTTPException(status_code=503, detail=results["error"])
+        
+        if not results:
+            print("⚠️ API: No data returned from Amazon scraper")
+            raise HTTPException(status_code=404, detail="No products found")
+        
+        return {"results": results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ API: Error in search_amazon: {e}")
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
 
 @app.get("/search/flipkart")
 async def search_flipkart(product: str = Query(..., min_length=1), max_results: int = Query(20)):
