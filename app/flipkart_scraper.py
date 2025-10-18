@@ -1,8 +1,12 @@
+# app/flipkart_scraper.py
+import os
 import time
 import random
 import re
+import traceback
 from typing import List, Dict, Optional
 from urllib.parse import quote_plus
+
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -10,11 +14,16 @@ from urllib3.util.retry import Retry
 
 SEARCH_URL = "https://www.flipkart.com/search?q={}"
 
+# Defaults can be overridden via env vars
+DEFAULT_READ_TIMEOUT = int(os.getenv("SCRAPER_READ_TIMEOUT", "30"))  # read timeout in seconds
+DEFAULT_CONNECT_TIMEOUT = int(os.getenv("SCRAPER_CONNECT_TIMEOUT", "5"))  # connect timeout in seconds
+DEFAULT_MAX_RETRIES = int(os.getenv("SCRAPER_MAX_RETRIES", "4"))
+DEFAULT_BACKOFF = float(os.getenv("SCRAPER_BACKOFF", "1.0"))
+
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    os.getenv("SCRAPER_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 ]
+
 
 def get_headers():
     return {
@@ -24,12 +33,66 @@ def get_headers():
         "Referer": "https://www.flipkart.com/"
     }
 
-def create_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[429,500,502,503,504], allowed_methods=frozenset(["GET"]))
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    return s
+
+def create_session(max_retries: int = DEFAULT_MAX_RETRIES, backoff_factor: float = DEFAULT_BACKOFF) -> requests.Session:
+    """
+    Create a requests Session with urllib3 Retry policy mounted.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"])
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _get_proxies_from_env() -> Optional[dict]:
+    http_p = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_p = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    if http_p or https_p:
+        return {"http": http_p, "https": https_p}
+    return None
+
+
+def fetch_search_html(query: str, attempts: int = 3, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT, read_timeout: int = DEFAULT_READ_TIMEOUT) -> str:
+    """
+    Fetch the search page HTML with robust attempts, exponential backoff, and optional proxy support.
+    Raises requests.exceptions.RequestException on final failure.
+    """
+    session = create_session()
+    proxies = _get_proxies_from_env()
+    url = SEARCH_URL.format(quote_plus(query))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            # connect/read timeout tuple
+            resp = session.get(url, headers=get_headers(), timeout=(connect_timeout, read_timeout), proxies=proxies)
+            resp.raise_for_status()
+            return resp.text
+        except requests.exceptions.RequestException as e:
+            # print concise error and then decide whether to retry
+            print(f"[scraper] fetch attempt {attempt}/{attempts} failed: {e}")
+            traceback.print_exc()
+            if attempt == attempts:
+                # re-raise the final exception so caller (FastAPI) can return proper 502
+                raise
+            # exponential backoff with jitter
+            sleep_for = (2 ** (attempt - 1)) * backoff_jitter()
+            print(f"[scraper] sleeping for {sleep_for:.2f}s before retry...")
+            time.sleep(sleep_for)
+    # should never get here
+    raise RuntimeError("fetch_search_html: exceeded attempts unexpectedly")
+
+
+def backoff_jitter() -> float:
+    """Return jitter multiplier for backoff; keeps things less synchronized."""
+    return DEFAULT_BACKOFF + random.random() * 0.5
+
 
 def _extract_image_src(tag) -> Optional[str]:
     if not tag:
@@ -53,6 +116,7 @@ def _extract_image_src(tag) -> Optional[str]:
         return first
     return None
 
+
 def _first_reasonable_text(text: str, min_len=6, max_len=220) -> Optional[str]:
     parts = [p.strip() for p in re.split(r'[\n\r|–\-•]+', text) if p.strip()]
     for p in parts:
@@ -60,69 +124,55 @@ def _first_reasonable_text(text: str, min_len=6, max_len=220) -> Optional[str]:
             return p
     return None
 
+
 def _clean_title(raw: str) -> Optional[str]:
-    """Clean large concatenated card text into a sane title or None."""
     if not raw:
         return None
     s = raw.strip()
-    # remove common prefix
     s = re.sub(r'^\s*Add to Compare\s*', '', s, flags=re.I)
-    # cut off from price marker onward (₹ usually marks start of price/offer junk)
     if "₹" in s:
         s = s.split("₹", 1)[0]
-    # remove 'xx Ratings' and 'xx Reviews' blocks
     s = re.sub(r'\d[\d,]*\s*Ratings?', '', s, flags=re.I)
     s = re.sub(r'\d[\d,]*\s*Reviews?', '', s, flags=re.I)
-    # remove phrases like "Upto..." / "Off on Exchange" etc (a conservative approach)
     s = re.split(r'Upto|Off on|Bank Offer|Only few left|In the box|Warranty|Warranty for', s, maxsplit=1, flags=re.I)[0]
-    # collapse whitespace
     s = re.sub(r'\s{2,}', ' ', s).strip()
-    # if still too long, take first sentence / chunk
     if len(s) > 180:
-        s = s[:180].rsplit(' ', 1)[0]  # avoid cutting mid-word
+        s = s[:180].rsplit(' ', 1)[0]
     return s if s else None
 
+
 def _extract_rating(card, a_tag=None) -> Optional[str]:
-    """
-    Extract rating as a single-digit or single-digit-with-decimal like '4' or '4.6'.
-    Avoid capturing review counts (which are large integers with commas).
-    """
-    # 1) common Flipkart rating element (e.g. div._3LWZlK)
+    # prefer strict rating selectors
     rating_selectors = ["div._3LWZlK", "span._2_KrJI"]
     for sel in rating_selectors:
         r = card.select_one(sel)
         if r:
             txt = r.get_text(strip=True)
-            # only accept patterns like 4 or 4.6 or 4.61 (limit decimals to at most 2)
             m = re.match(r'^[0-5](?:\.[0-9]{1,2})?$', txt)
             if m:
                 return m.group(0)
-    # 2) look for 'x.x ★' or 'x.x out of 5' near the card text
     full = card.get_text(" ", strip=True)
     m = re.search(r'([0-5](?:\.[0-9]{1,2})?)\s*(?:★|out of 5|/5)', full, flags=re.I)
     if m:
         return m.group(1)
-    # 3) sometimes rating sits inside the anchor or adjacent small text, try a_tag
     if a_tag:
         a_text = a_tag.get_text(" ", strip=True)
         m = re.search(r'([0-5](?:\.[0-9]{1,2})?)\s*(?:★|out of 5|/5)', a_text, flags=re.I)
         if m:
             return m.group(1)
-    # If nothing reliable found, return None (do NOT return big ints)
     return None
 
-def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) -> List[Dict]:
-    session = create_session()
-    try:
-        session.get("https://www.flipkart.com", headers=get_headers(), timeout=6)
-    except Exception:
-        pass
 
-    url = SEARCH_URL.format(quote_plus(query))
-    time.sleep(random.uniform(0.2, 0.7))
-    resp = session.get(url, headers=get_headers(), timeout=12)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) -> List[Dict]:
+    """
+    High-level scraper: fetches HTML (robust) then parses product cards.
+    This function raises requests.exceptions.RequestException when the upstream fetch fails.
+    """
+    # fetch HTML with retries; exceptions propagate
+    html = fetch_search_html(query, attempts=int(os.getenv("SCRAPER_FETCH_ATTEMPTS", "4")),
+                             connect_timeout=int(os.getenv("SCRAPER_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT)),
+                             read_timeout=int(os.getenv("SCRAPER_READ_TIMEOUT", DEFAULT_READ_TIMEOUT)))
+    soup = BeautifulSoup(html, "html.parser")
 
     container_selectors = [
         "div._13oc-S", "div[data-id]", "div._1AtVbE", "div._2kHMtA",
@@ -135,9 +185,10 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
         if found:
             candidates = found
             if verbose:
-                print(f"Found {len(found)} candidates with selector: {sel}")
+                print(f"[scraper] found {len(found)} candidates with selector: {sel}")
             break
 
+    # anchor fallback
     if not candidates:
         anchors = soup.find_all("a", href=re.compile(r"/p/"))
         seen = set()
@@ -151,9 +202,9 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
             seen.add(key)
             candidates.append(a)
         if verbose:
-            print(f"Fallback anchors found: {len(candidates)}")
+            print(f"[scraper] fallback anchors found: {len(candidates)}")
 
-    results = []
+    results: List[Dict] = []
     title_selectors = ["div._4rR01T", "a.s1Q9rs", "a.IRpwTa", "div._2WkVRV", "span.B_NuCI", "div._3wU53n"]
     price_selectors = ["div._30jeq3", "div._1vC4OE", "div._25b18c", "span._2-ut7f"]
 
@@ -161,7 +212,6 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
         if len(results) >= max_results:
             break
         try:
-            # find anchor
             a_tag = None
             if card.name == "a" and card.get("href") and re.search(r"/p/", card.get("href")):
                 a_tag = card
@@ -178,7 +228,7 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                     else:
                         link = "https://www.flipkart.com" + href
 
-            # TITLE: prefer strict selectors; only fallback to big text when necessary, then CLEAN it
+            # TITLE extraction with clean fallback
             title = None
             for ts in title_selectors:
                 t = card.select_one(ts)
@@ -186,11 +236,9 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                     title = t.get_text(strip=True)
                     break
             if not title and a_tag:
-                # try anchor title attribute
                 title = (a_tag.get("title") or a_tag.get_text(strip=True)) or None
 
             if not title:
-                # fallback to first reasonable chunk and then clean
                 raw = card.get_text(" ", strip=True)
                 candidate_title = _first_reasonable_text(raw)
                 title = _clean_title(candidate_title or raw)
@@ -210,7 +258,7 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                 if m:
                     price = m.group().replace(" ", "")
 
-            # RATING (robust)
+            # RATING
             rating = _extract_rating(card, a_tag=a_tag)
 
             # IMAGE
@@ -229,26 +277,25 @@ def scrape_flipkart(query: str, max_results: int = 20, verbose: bool = False) ->
                 "rating": rating if rating else None
             }
 
-            # skip if no title and no link
             if not item["title"] and not item["link"]:
                 if verbose:
-                    print(f"Skipping candidate #{idx}: no title and no link")
+                    print(f"[scraper] skipping candidate #{idx}: no title and no link")
                 continue
 
             results.append(item)
 
             if verbose:
-                found = [k for k,v in item.items() if v is not None]
-                missing = [k for k,v in item.items() if v is None]
-                print(f"Candidate #{idx} -> found: {found} | missing: {missing}")
+                found = [k for k, v in item.items() if v is not None]
+                missing = [k for k, v in item.items() if v is None]
+                print(f"[scraper] candidate #{idx} -> found: {found} | missing: {missing}")
 
         except Exception as e:
             if verbose:
-                print(f"Error processing candidate #{idx}: {e}")
+                print(f"[scraper] error processing candidate #{idx}: {e}")
+                traceback.print_exc()
             continue
 
     if verbose:
-        print(f"Scraped {len(results)} items for query={query}")
+        print(f"[scraper] scraped {len(results)} items for query={query}")
 
     return results
-
