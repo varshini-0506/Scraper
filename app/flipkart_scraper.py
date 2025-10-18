@@ -150,7 +150,7 @@ def scrape_flipkart(query: str, max_results=50):
         # Debug: Print first 2000 characters of HTML
         print(f"HTML content preview: {html[:2000]}...")
 
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html5lib")
         
         # Debug: Look for any divs with data-id
         all_divs_with_data_id = soup.select('div[data-id]')

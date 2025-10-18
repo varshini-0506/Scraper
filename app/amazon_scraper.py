@@ -82,7 +82,7 @@ def fast_scrape_amazon_products(query: str, max_results=50):
         if any(indicator.lower() in html.lower() for indicator in block_indicators):
             return {"error": "Blocked by Amazon - CAPTCHA or rate limiting detected"}
         
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html5lib")
         results = []
         
         # Multiple selectors to capture ALL product types from Amazon results
