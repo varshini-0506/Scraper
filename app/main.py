@@ -1,10 +1,9 @@
 from fastapi import FastAPI, Query, HTTPException
 from app.amazon_scraper import fast_scrape_amazon_products
-from app.flipkart_scraper import scrape_flipkart
 import traceback
-from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 import requests
+from app.flipkart_scraper import scraper
 
 app = FastAPI(
     title="Amazon & Flipkart Scraper API",
@@ -49,20 +48,15 @@ def search_amazon(product: str = Query(...), max_results: int = 20):
     return {"results": results}
 
 @app.get("/search/flipkart")
-def search_flipkart(product: str, max_results: int = 12):
+async def search_flipkart(product: str = Query(..., min_length=1), max_results: int = Query(20)):
     try:
-        results = scrape_flipkart(product, max_results=max_results)
-        return JSONResponse({"results": results})
-    except requests.exceptions.RequestException as e:
-        # upstream network or remote site error
-        print("[route] upstream request error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
+        data = await scraper.scrape(product, max_results)
+        if not data:
+            raise HTTPException(status_code=404, detail="No products found")
+        return {"results": data}
     except Exception as e:
-        print("[route] internal error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
-
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
+        
 @app.get("/search/both")
 def search_both(product: str = Query(...), max_results: int = 20):
     """
