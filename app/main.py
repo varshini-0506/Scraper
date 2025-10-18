@@ -50,12 +50,20 @@ def search_amazon(product: str = Query(...), max_results: int = 20):
 @app.get("/search/flipkart")
 async def search_flipkart(product: str = Query(..., min_length=1), max_results: int = Query(20)):
     try:
+        print(f"🔍 API: Scraping Flipkart for '{product}' with max_results={max_results}")
         data = await scraper.scrape(product, max_results)
+        print(f"📊 API: Received {len(data)} results from scraper")
+        
         if not data:
+            print("⚠️ API: No data returned from scraper")
             raise HTTPException(status_code=404, detail="No products found")
+        
         return {"results": data}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
+        print(f"❌ API: Error in search_flipkart: {e}")
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(e)}")
         
 @app.get("/search/both")
 def search_both(product: str = Query(...), max_results: int = 20):

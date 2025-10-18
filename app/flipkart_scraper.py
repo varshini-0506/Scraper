@@ -17,20 +17,58 @@ def scrape_flipkart(query: str, max_results: int = 20):
         
         headers = {
             "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "Cache-Control": "max-age=0"
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "Referer": "https://www.google.com/",
+            "Origin": "https://www.flipkart.com"
         }
         
         url = f"https://www.flipkart.com/search?q={query.replace(' ', '+')}"
         print(f"🔍 Scraping Flipkart for: {query}")
         
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        # Create session with retry strategy
+        session = requests.Session()
+        
+        # Configure retry strategy
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Add random delay to avoid rate limiting
+        import time
+        time.sleep(random.uniform(1, 3))
+        
+        try:
+            response = session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.Timeout:
+            print("❌ Request timed out, trying with shorter timeout...")
+            response = session.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request failed: {e}")
+            # Try with different headers
+            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            response = session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
         
         soup = BeautifulSoup(response.text, "html5lib")
         
@@ -220,7 +258,15 @@ def scrape_flipkart(query: str, max_results: int = 20):
         
     except Exception as e:
         print(f"❌ Error scraping Flipkart: {e}")
-        return []
+        # Return a fallback response with mock data
+        print("🔄 Returning fallback data due to scraping error")
+        return [{
+            "title": f"{query} - Product not available",
+            "link": "https://www.flipkart.com",
+            "image": None,
+            "price": "Price not available",
+            "rating": None
+        }]
 
 # Create a scraper object that main.py expects
 class FlipkartScraper:
